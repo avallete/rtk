@@ -217,9 +217,34 @@ elif echo "$MATCH_CMD" | grep -qE '^psql([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^psql/rtk psql/')"
 fi
 
-# If no rewrite needed, approve as-is
+# If no rewrite matched, route through rtk proxy for token tracking
 if [ -z "$REWRITTEN" ]; then
-  exit 0
+  # Exclusions: commands that should never be proxied
+  case "$MATCH_CMD" in
+    # Shell builtins (can't exec as external commands)
+    cd|cd\ *|echo|echo\ *|printf|printf\ *|export|export\ *|source|source\ *) exit 0 ;;
+    set|set\ *|unset|unset\ *|alias|alias\ *|type|type\ *) exit 0 ;;
+    # File manipulation (fast, trivial output)
+    mkdir|mkdir\ *|rm|rm\ *|mv|mv\ *|cp|cp\ *|chmod|chmod\ *|chown|chown\ *|touch|touch\ *|ln|ln\ *) exit 0 ;;
+    # Process/flow control
+    kill|kill\ *|sleep|sleep\ *|wait|true|false|exit|exit\ *) exit 0 ;;
+    # Shell keywords
+    if|then|else|elif|fi|for|while|until|do|done|case|esac|function) exit 0 ;;
+    # Text processing (usually mid-pipe, low standalone value)
+    sort|sort\ *|uniq|uniq\ *|tr|tr\ *|cut|cut\ *|awk|awk\ *|sed|sed\ *|wc|wc\ *) exit 0 ;;
+    # Inline scripts
+    python*\ -c\ *|node\ -e\ *|ruby\ -e\ *|bash\ -c\ *|sh\ -c\ *) exit 0 ;;
+    # Editors/interactive
+    vim|vim\ *|vi|vi\ *|nano|nano\ *|less|less\ *|more|more\ *) exit 0 ;;
+  esac
+
+  # Skip piped commands (proxy only sees first segment, incomplete picture)
+  case "$CMD" in
+    *\|*) exit 0 ;;
+  esac
+
+  # Route through rtk proxy (buffers output, tracks exact token count)
+  REWRITTEN="${ENV_PREFIX}rtk proxy ${CMD_BODY}"
 fi
 
 # Build the updated tool_input with all original fields preserved, only command changed

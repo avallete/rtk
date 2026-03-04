@@ -300,6 +300,25 @@ impl Tracker {
             [],
         );
 
+        // Migration: add command_type column to distinguish filtered vs proxy vs passthrough
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN command_type TEXT DEFAULT 'filtered'",
+            [],
+        );
+        // Migration: add base_command for analytics grouping (e.g., "terraform plan")
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN base_command TEXT DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_base_command ON commands(base_command)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_command_type ON commands(command_type)",
+            [],
+        );
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
                 id INTEGER PRIMARY KEY,
@@ -370,6 +389,50 @@ impl Tracker {
                 saved as i64,
                 pct,
                 exec_time_ms as i64
+            ],
+        )?;
+
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// Record a command with explicit type and base command for analytics.
+    ///
+    /// Used by proxy tracking to distinguish filtered/proxy/passthrough commands.
+    pub fn record_typed(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+        command_type: &str,
+        base_command: &str,
+    ) -> Result<()> {
+        let saved = input_tokens.saturating_sub(output_tokens);
+        let pct = if input_tokens > 0 {
+            (saved as f64 / input_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let project_path = current_project_path_string();
+
+        self.conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, command_type, base_command)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                Utc::now().to_rfc3339(),
+                original_cmd,
+                rtk_cmd,
+                project_path,
+                input_tokens as i64,
+                output_tokens as i64,
+                saved as i64,
+                pct,
+                exec_time_ms as i64,
+                command_type,
+                base_command,
             ],
         )?;
 
@@ -886,6 +949,102 @@ impl Tracker {
 
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// Get top unoptimized commands (command_type = 'proxy') grouped by base_command.
+    pub fn get_unoptimized_summary(
+        &self,
+        project_path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UnoptimizedEntry>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT base_command, COUNT(*) as cnt,
+                    SUM(input_tokens) as total_input,
+                    AVG(input_tokens) as avg_input,
+                    SUM(exec_time_ms) as total_time,
+                    original_cmd
+             FROM commands
+             WHERE command_type = 'proxy'
+               AND base_command != ''
+               AND (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY base_command
+             ORDER BY total_input DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob, limit as i64], |row| {
+            Ok(UnoptimizedEntry {
+                base_command: row.get(0)?,
+                count: row.get::<_, i64>(1)? as usize,
+                total_input_tokens: row.get::<_, i64>(2)? as usize,
+                avg_input_tokens: row.get::<_, f64>(3)? as usize,
+                total_exec_time_ms: row.get::<_, i64>(4)? as u64,
+                example_command: row.get(5)?,
+            })
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Get weekly optimization coverage (filtered vs proxy counts).
+    pub fn get_optimization_coverage(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Vec<CoverageWeek>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                DATE(timestamp, 'weekday 0', '-6 days') as week_start,
+                SUM(CASE WHEN command_type != 'proxy' THEN 1 ELSE 0 END) as filtered_count,
+                SUM(CASE WHEN command_type = 'proxy' THEN 1 ELSE 0 END) as proxy_count
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY week_start
+             ORDER BY week_start DESC
+             LIMIT 8",
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            let filtered: i64 = row.get(1)?;
+            let proxy: i64 = row.get(2)?;
+            let total = filtered + proxy;
+            let coverage_pct = if total > 0 {
+                (filtered as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            Ok(CoverageWeek {
+                week_start: row.get(0)?,
+                filtered_count: filtered as usize,
+                proxy_count: proxy as usize,
+                coverage_pct,
+            })
+        })?;
+
+        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        result.reverse();
+        Ok(result)
+    }
+}
+
+/// Summary of an unoptimized command group (for `rtk waste`).
+#[derive(Debug, Serialize)]
+pub struct UnoptimizedEntry {
+    pub base_command: String,
+    pub count: usize,
+    pub total_input_tokens: usize,
+    pub avg_input_tokens: usize,
+    pub total_exec_time_ms: u64,
+    pub example_command: String,
+}
+
+/// Weekly optimization coverage stats (for `rtk waste`).
+#[derive(Debug, Serialize)]
+pub struct CoverageWeek {
+    pub week_start: String,
+    pub filtered_count: usize,
+    pub proxy_count: usize,
+    pub coverage_pct: f64,
 }
 
 fn get_db_path() -> Result<PathBuf> {
@@ -1039,6 +1198,28 @@ impl TimedExecution {
         }
     }
 
+    /// Track a proxy command (unoptimized, input = output, command_type = "proxy").
+    ///
+    /// Records the command with exact token counts but 0% savings,
+    /// and extracts the base command for aggregation in `rtk waste`.
+    pub fn track_proxy(&self, original_cmd: &str, rtk_cmd: &str, output: &str) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let tokens = estimate_tokens(output);
+        let base_command = extract_base_command(original_cmd);
+
+        if let Ok(tracker) = Tracker::new() {
+            let _ = tracker.record_typed(
+                original_cmd,
+                rtk_cmd,
+                tokens,
+                tokens, // input = output (no savings)
+                elapsed_ms,
+                "proxy",
+                &base_command,
+            );
+        }
+    }
+
     /// Track passthrough commands (timing-only, no token counting).
     ///
     /// For commands that stream output or run interactively where output
@@ -1114,6 +1295,56 @@ pub fn args_display(args: &[OsString]) -> String {
 /// let timer = TimedExecution::start();
 /// timer.track("ls -la", "rtk ls", "input", "output");
 /// ```
+/// Extract the base command (first 1-2 words) from a full command string.
+///
+/// Examples:
+/// - "terraform plan -var-file=prod.tfvars" → "terraform plan"
+/// - "make build RELEASE=1" → "make build"
+/// - "flutter test --coverage" → "flutter test"
+/// - "ls -la" → "ls"
+///
+/// For known multi-word commands (git, docker, kubectl, go, cargo, etc.),
+/// returns the first two words. For others, returns just the first word.
+pub fn extract_base_command(cmd: &str) -> String {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    let first = parts[0];
+
+    // Commands that typically have subcommands
+    const MULTI_WORD_CMDS: &[&str] = &[
+        "git",
+        "docker",
+        "kubectl",
+        "cargo",
+        "go",
+        "npm",
+        "pnpm",
+        "yarn",
+        "pip",
+        "uv",
+        "terraform",
+        "ansible",
+        "aws",
+        "gcloud",
+        "az",
+        "gh",
+        "flutter",
+        "dart",
+        "dotnet",
+        "helm",
+        "make",
+    ];
+
+    if parts.len() > 1 && MULTI_WORD_CMDS.contains(&first) && !parts[1].starts_with('-') {
+        format!("{} {}", first, parts[1])
+    } else {
+        first.to_string()
+    }
+}
+
 #[deprecated(note = "Use TimedExecution instead")]
 pub fn track(original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
     let input_tokens = estimate_tokens(input);
@@ -1352,5 +1583,66 @@ mod tests {
         // We can't assert exact rate because other tests may have added records,
         // but we can verify recovery_rate is between 0 and 100
         assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    // 14. extract_base_command — multi-word commands
+    #[test]
+    fn test_extract_base_command() {
+        assert_eq!(
+            extract_base_command("terraform plan -var-file=prod.tfvars"),
+            "terraform plan"
+        );
+        assert_eq!(extract_base_command("make build RELEASE=1"), "make build");
+        assert_eq!(
+            extract_base_command("flutter test --coverage"),
+            "flutter test"
+        );
+        assert_eq!(extract_base_command("ls -la"), "ls");
+        assert_eq!(extract_base_command("which ls"), "which");
+        assert_eq!(extract_base_command(""), "");
+        assert_eq!(extract_base_command("git -C /path status"), "git"); // flags start with -, not treated as subcommand
+        assert_eq!(
+            extract_base_command("cargo test -- --nocapture"),
+            "cargo test"
+        );
+    }
+
+    // 15. record_typed + get_unoptimized_summary roundtrip
+    #[test]
+    fn test_record_typed_proxy() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let original = format!("terraform plan test_{}", pid);
+        let rtk = format!("rtk proxy terraform plan test_{}", pid);
+
+        tracker
+            .record_typed(&original, &rtk, 500, 500, 100, "proxy", "terraform plan")
+            .expect("Failed to record typed");
+
+        let unopt = tracker
+            .get_unoptimized_summary(None, 50)
+            .expect("Failed to get unoptimized");
+
+        let entry = unopt.iter().find(|e| e.base_command == "terraform plan");
+        assert!(
+            entry.is_some(),
+            "terraform plan should appear in unoptimized summary"
+        );
+        assert!(entry.unwrap().count >= 1);
+    }
+
+    // 16. get_optimization_coverage returns valid data
+    #[test]
+    fn test_optimization_coverage() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+
+        let coverage = tracker
+            .get_optimization_coverage(None)
+            .expect("Failed to get coverage");
+
+        // Just verify it doesn't crash and returns valid percentages
+        for week in &coverage {
+            assert!(week.coverage_pct >= 0.0 && week.coverage_pct <= 100.0);
+        }
     }
 }

@@ -19,6 +19,8 @@ pub struct ExtractedCommand {
     pub is_error: bool,
     /// Chronological sequence index within the session
     pub sequence_index: usize,
+    /// LLM's reasoning text from the assistant message that contained the tool_use
+    pub assistant_context: Option<String>,
 }
 
 /// Trait for session providers (Claude Code, future: Cursor, Windsurf).
@@ -129,7 +131,7 @@ impl SessionProvider for ClaudeProvider {
 
         // First pass: collect all tool_use Bash commands with their IDs and sequence
         // Second pass (same loop): collect tool_result output lengths, content, and error status
-        let mut pending_tool_uses: Vec<(String, String, usize)> = Vec::new(); // (tool_use_id, command, sequence)
+        let mut pending_tool_uses: Vec<(String, String, usize, Option<String>)> = Vec::new(); // (tool_use_id, command, sequence, assistant_context)
         let mut tool_results: HashMap<String, (usize, String, bool)> = HashMap::new(); // (len, content, is_error)
         let mut commands = Vec::new();
         let mut sequence_counter = 0;
@@ -158,6 +160,14 @@ impl SessionProvider for ClaudeProvider {
                     if let Some(content) =
                         entry.pointer("/message/content").and_then(|c| c.as_array())
                     {
+                        // Extract the last text block as assistant reasoning context
+                        let assistant_text: Option<String> = content
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .last()
+                            .and_then(|b| b.get("text").and_then(|t| t.as_str()))
+                            .map(|t| t.chars().take(500).collect());
+
                         for block in content {
                             if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
                                 && block.get("name").and_then(|n| n.as_str()) == Some("Bash")
@@ -170,6 +180,7 @@ impl SessionProvider for ClaudeProvider {
                                         id.to_string(),
                                         cmd.to_string(),
                                         sequence_counter,
+                                        assistant_text.clone(),
                                     ));
                                     sequence_counter += 1;
                                 }
@@ -214,7 +225,7 @@ impl SessionProvider for ClaudeProvider {
         }
 
         // Match tool_uses with their results
-        for (tool_id, command, sequence_index) in pending_tool_uses {
+        for (tool_id, command, sequence_index, assistant_context) in pending_tool_uses {
             let (output_len, output_content, is_error) = tool_results
                 .get(&tool_id)
                 .map(|(len, content, err)| (Some(*len), Some(content.clone()), *err))
@@ -227,6 +238,7 @@ impl SessionProvider for ClaudeProvider {
                 output_content,
                 is_error,
                 sequence_index,
+                assistant_context,
             });
         }
 

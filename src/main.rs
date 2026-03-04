@@ -40,6 +40,7 @@ mod prisma_cmd;
 mod psql_cmd;
 mod pytest_cmd;
 mod read;
+mod reflect_cmd;
 mod ruff_cmd;
 mod runner;
 mod summary;
@@ -49,6 +50,7 @@ mod tree;
 mod tsc_cmd;
 mod utils;
 mod vitest_cmd;
+mod waste_cmd;
 mod wc_cmd;
 mod wget_cmd;
 
@@ -610,6 +612,44 @@ enum Commands {
         #[arg(short, long, default_value = "7")]
         since: u64,
     },
+
+    /// Show unoptimized commands and their token consumption
+    Waste {
+        /// Filter to current project
+        #[arg(short, long)]
+        project: bool,
+        /// Show weekly trend
+        #[arg(short, long)]
+        weekly: bool,
+        /// Show daily breakdown
+        #[arg(short, long)]
+        daily: bool,
+        /// Max commands to show
+        #[arg(short, long, default_value = "15")]
+        limit: usize,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Generate LLM prompt to plan new RTK filter implementations
+    Reflect {
+        /// Filter by project path
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Scan all projects
+        #[arg(short, long)]
+        all: bool,
+        /// Sessions from last N days
+        #[arg(short, long, default_value = "30")]
+        since: u64,
+        /// Max commands to analyze
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -936,6 +976,8 @@ const RTK_META_COMMANDS: &[&str] = &[
     "proxy",
     "hook-audit",
     "cc-economics",
+    "waste",
+    "reflect",
 ];
 
 fn run_fallback(parse_error: clap::Error) -> Result<()> {
@@ -1734,11 +1776,10 @@ fn main() -> Result<()> {
             print!("{}", stdout);
             eprint!("{}", stderr);
 
-            // Track usage (input = output since no filtering)
-            timer.track(
+            // Track usage as proxy (input = output, command_type = "proxy")
+            timer.track_proxy(
                 &format!("{} {}", cmd_name, cmd_args.join(" ")),
                 &format!("rtk proxy {} {}", cmd_name, cmd_args.join(" ")),
-                &full_output,
                 &full_output,
             );
 
@@ -1750,6 +1791,26 @@ fn main() -> Result<()> {
 
         Commands::Verify => {
             integrity::run_verify(cli.verbose)?;
+        }
+
+        Commands::Waste {
+            project,
+            weekly,
+            daily,
+            limit,
+            format,
+        } => {
+            waste_cmd::run(project, weekly, daily, limit, &format, cli.verbose)?;
+        }
+
+        Commands::Reflect {
+            project,
+            all,
+            since,
+            limit,
+            format,
+        } => {
+            reflect_cmd::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
         }
     }
 
@@ -1995,6 +2056,8 @@ mod tests {
             vec!["rtk", "proxy", "echo", "hi"],
             vec!["rtk", "hook-audit"],
             vec!["rtk", "cc-economics"],
+            vec!["rtk", "waste"],
+            vec!["rtk", "reflect"],
         ];
         for args in &meta_cmds_that_parse {
             let result = Cli::try_parse_from(args.iter());
