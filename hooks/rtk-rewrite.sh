@@ -1,7 +1,7 @@
 #!/bin/bash
-# RTK auto-rewrite hook for Claude Code PreToolUse:Bash
+# RTK auto-rewrite hook for Claude Code PreToolUse:Bash and Cursor preToolUse (Shell).
 # Transparently rewrites raw commands to their rtk equivalents.
-# Outputs JSON with updatedInput to modify the command before execution.
+# Outputs JSON: Claude = hookSpecificOutput.updatedInput; Cursor = decision + updated_input.
 
 # Guards: skip silently if dependencies missing
 if ! command -v rtk &>/dev/null || ! command -v jq &>/dev/null; then
@@ -11,6 +11,19 @@ fi
 set -euo pipefail
 
 INPUT=$(cat)
+# Detect Cursor vs Claude Code from payload shape.
+# Cursor payloads include "hook_event_name" or "cursor_version" as top-level strings.
+# Claude Code payloads have none of these; they nest event info inside hookSpecificOutput.
+# If both agents add overlapping fields in the future, set RTK_HOOK_MODE=cursor|claude to override.
+CURSOR_MODE=
+if [ "${RTK_HOOK_MODE:-}" = "cursor" ]; then
+  CURSOR_MODE=1
+elif [ "${RTK_HOOK_MODE:-}" = "claude" ]; then
+  CURSOR_MODE=
+elif echo "$INPUT" | jq -e '.hook_event_name // .cursor_version | type == "string"' &>/dev/null; then
+  CURSOR_MODE=1
+fi
+
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
 if [ -z "$CMD" ]; then
@@ -213,14 +226,22 @@ fi
 ORIGINAL_INPUT=$(echo "$INPUT" | jq -c '.tool_input')
 UPDATED_INPUT=$(echo "$ORIGINAL_INPUT" | jq --arg cmd "$REWRITTEN" '.command = $cmd')
 
-# Output the rewrite instruction
-jq -n \
-  --argjson updated "$UPDATED_INPUT" \
-  '{
-    "hookSpecificOutput": {
-      "hookEventName": "PreToolUse",
-      "permissionDecision": "allow",
-      "permissionDecisionReason": "RTK auto-rewrite",
-      "updatedInput": $updated
-    }
-  }'
+# Output the rewrite instruction (format depends on host)
+if [ -n "$CURSOR_MODE" ]; then
+  # Cursor preToolUse: https://cursor.com/docs/agent/hooks
+  jq -n \
+    --argjson updated "$UPDATED_INPUT" \
+    '{ "decision": "allow", "updated_input": $updated }'
+else
+  # Claude Code PreToolUse
+  jq -n \
+    --argjson updated "$UPDATED_INPUT" \
+    '{
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": "RTK auto-rewrite",
+        "updatedInput": $updated
+      }
+    }'
+fi

@@ -1,0 +1,39 @@
+---
+description: Use rtk (Rust Token Killer) to wrap CLI commands for token-optimized output (60-90% savings)
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# RTK Command Proxy
+
+When running shell commands, prefer `rtk <cmd>` over raw commands for token-optimized output. rtk is a CLI proxy that reduces LLM token consumption by 60-90% through smart filtering.
+
+Leading env var assignments should be preserved (e.g., `FOO=bar cargo test` → `FOO=bar rtk cargo test`).
+
+## Custom Rules (rtk err — errors-only wrapper)
+
+These commands have no native rtk filter. Wrap with `rtk err` to show only stderr/errors:
+
+- `pre-commit ...` → `rtk err pre-commit ...`
+- `make ...` → `rtk err make ...`
+- `go generate ...` → `rtk err go generate ...`
+- `pnpm run <script>` → `rtk err pnpm run <script>`
+
+## Native RTK Rewrites
+
+- **Git**: `git <subcmd>` → `rtk git <subcmd>` (all subcommands)
+- **GitHub CLI**: `gh pr|issue|run|api|release ...` → `rtk gh ...`
+- **Cargo**: `cargo test|build|clippy|check|install|fmt` → `rtk cargo ...`
+- **File ops**: `cat` → `rtk read`, `rg|grep` → `rtk grep`, `ls` → `rtk ls`, `tree` → `rtk tree`, `find|diff` → `rtk find|diff`
+- **JS/TS**: `vitest|tsc|eslint|prettier|playwright|prisma|pnpm list|outdated` → `rtk vitest|tsc|lint|prettier|playwright|prisma|pnpm ...`
+- **Python**: `pytest|ruff check|format|pip|uv pip` → `rtk pytest|ruff|pip ...`
+- **Go**: `go test|build|vet` → `rtk go ...`, `golangci-lint` → `rtk golangci-lint`
+- **Containers**: `docker compose|docker ps|images|logs|...` → `rtk docker ...`, `kubectl get|logs|...` → `rtk kubectl ...`
+- **Network**: `curl|wget` → `rtk curl|wget`
+
+## Exceptions — Do NOT wrap with rtk
+
+- Commands already prefixed with `rtk`
+- Commands with heredocs (`<<`)
+- Interactive commands (e.g., `git rebase -i`)
+- Commands that must produce exact raw output for parsing by other tools

@@ -373,6 +373,8 @@ Four strategies applied per command type:
 | `rtk init -g --claude-md` | Global | ❌ | ❌ | Full (137 lines) | ~2000 | Legacy compatibility |
 | `rtk init -g --hook-only` | Global | ✅ | ❌ | Nothing | 0 | Minimal setup, hook-only |
 | `rtk init` | Local | ❌ | ❌ | Full (137 lines) | ~2000 | Single project, no hook |
+| `rtk init --cursor` | Project | Cursor hook | rtk.mdc | .cursor/hooks.json | 0 | Cursor Agent (preToolUse) |
+| `rtk init --cursor -g` | Global | Cursor hook | rtk.mdc | ~/.cursor/hooks.json | 0 | Cursor Agent, all projects |
 
 ```bash
 rtk init --show         # Show current configuration
@@ -400,6 +402,15 @@ rtk init -g --hook-only     # Hook only, no RTK.md
 ```bash
 rtk init -g --uninstall     # Remove all RTK artifacts
 ```
+
+**Cursor** (Agent / Cmd+K):
+```bash
+rtk init --cursor           # Project: .cursor/hooks + .cursor/rules/rtk.mdc + .cursor/hooks.json
+rtk init --cursor -g        # Global: ~/.cursor/ (same layout)
+rtk init --cursor --show    # Show Cursor RTK status (global + project)
+rtk init --cursor -g --uninstall   # Remove global Cursor RTK
+```
+Uses the same rewrite hook (preToolUse for Shell); Cursor runs it via `hooks.json` and gets rules from `rtk.mdc`. Restart Cursor after init.
 
 **What is settings.json?**
 Claude Code configuration file that registers the RTK hook. The hook transparently rewrites commands (e.g., `git status` → `rtk git status`) before execution. Without this registration, Claude won't use the hook.

@@ -128,9 +128,10 @@ main.rs (CLI entry)
   - Priority: env var > config file > default location
 
 **4. Configuration System** (src/config.rs, src/init.rs)
-- Manages CLAUDE.md initialization (global vs local)
+- Manages CLAUDE.md initialization (global vs local) and Cursor (hooks + rules)
 - Reads ~/.config/rtk/config.toml for user preferences
-- `rtk init` command bootstraps LLM integration
+- `rtk init` bootstraps Claude Code; `rtk init --cursor` bootstraps Cursor (hooks.json + rtk.mdc)
+- **Adding a new agent (Codex, OpenCode, etc.)**: Add an `InitTarget` variant in init.rs, implement `run_<agent>_mode` (reuse `ensure_agent_hook_installed`, `patch_json_registry` with agent-specific is_present/insert), and branch in `show_config`/`uninstall`. See doc comment on `InitTarget` in src/init.rs.
 - **New**: `tracking.database_path` field for custom DB location
 
 **5. Tee Output Recovery** (src/tee.rs)

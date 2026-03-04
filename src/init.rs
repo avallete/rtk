@@ -12,6 +12,9 @@ const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
 
+// Cursor rules file content (.mdc with frontmatter)
+const CURSOR_RTK_RULES: &str = include_str!("../hooks/rtk-cursor-rules.mdc");
+
 /// Control flow for settings.json patching
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatchMode {
@@ -27,6 +30,30 @@ pub enum PatchResult {
     AlreadyPresent, // Hook was already in settings.json
     Declined,       // User declined when prompted
     Skipped,        // --no-patch flag used
+}
+
+/// Agent/editor target for init.
+///
+/// To add a new target (e.g. Codex, OpenCode):
+/// 1. Add a variant here and extend `from_cursor_flag` or add a new CLI flag and map it in main.rs.
+/// 2. In `run()`, add a branch that calls a new `run_<agent>_mode()`.
+/// 3. Implement: resolve config dir (global vs project), `ensure_agent_hook_installed` + optional rules file,
+///    then `patch_json_registry` with agent-specific is_present/insert/on_skip (reuse same REWRITE_HOOK if hook contract is compatible).
+/// 4. In `show_config()` and `uninstall()`, add a branch for the new target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitTarget {
+    Claude,
+    Cursor,
+}
+
+impl InitTarget {
+    pub fn from_cursor_flag(cursor: bool) -> Self {
+        if cursor {
+            InitTarget::Cursor
+        } else {
+            InitTarget::Claude
+        }
+    }
 }
 
 // Legacy full instructions for backward compatibility (--claude-md mode)
@@ -172,8 +199,13 @@ pub fn run(
     hook_only: bool,
     patch_mode: PatchMode,
     verbose: u8,
+    target: InitTarget,
 ) -> Result<()> {
-    // Mode selection
+    match target {
+        InitTarget::Cursor => return run_cursor_mode(global, patch_mode, verbose),
+        InitTarget::Claude => {}
+    }
+    // Claude mode selection
     match (claude_md, hook_only) {
         (true, _) => run_claude_md_mode(global, verbose),
         (false, true) => run_hook_only_mode(global, patch_mode, verbose),
@@ -189,56 +221,6 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf)> {
         .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
     let hook_path = hook_dir.join("rtk-rewrite.sh");
     Ok((hook_dir, hook_path))
-}
-
-/// Write hook file if missing or outdated, return true if changed
-#[cfg(unix)]
-fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
-    let changed = if hook_path.exists() {
-        let existing = fs::read_to_string(hook_path)
-            .with_context(|| format!("Failed to read existing hook: {}", hook_path.display()))?;
-
-        if existing == REWRITE_HOOK {
-            if verbose > 0 {
-                eprintln!("Hook already up to date: {}", hook_path.display());
-            }
-            false
-        } else {
-            fs::write(hook_path, REWRITE_HOOK)
-                .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
-            if verbose > 0 {
-                eprintln!("Updated hook: {}", hook_path.display());
-            }
-            true
-        }
-    } else {
-        fs::write(hook_path, REWRITE_HOOK)
-            .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
-        if verbose > 0 {
-            eprintln!("Created hook: {}", hook_path.display());
-        }
-        true
-    };
-
-    // Set executable permissions
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
-
-    // Store SHA-256 hash for runtime integrity verification.
-    // Always store (idempotent) to ensure baseline exists even for
-    // hooks installed before integrity checks were added.
-    integrity::store_hash(hook_path).with_context(|| {
-        format!(
-            "Failed to store integrity hash for {}",
-            hook_path.display()
-        )
-    })?;
-    if verbose > 0 && changed {
-        eprintln!("Stored integrity hash for hook");
-    }
-
-    Ok(changed)
 }
 
 /// Idempotent file write: create or update if content differs
@@ -414,8 +396,11 @@ fn remove_hook_from_settings(verbose: u8) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall: remove hook, RTK.md, @RTK.md reference, settings.json entry
-pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
+/// Full uninstall: remove Claude or Cursor RTK artifacts
+pub fn uninstall(global: bool, verbose: u8, target: InitTarget) -> Result<()> {
+    if target == InitTarget::Cursor {
+        return uninstall_cursor(global, verbose);
+    }
     if !global {
         anyhow::bail!("Uninstall only works with --global flag. For local projects, manually remove RTK from CLAUDE.md");
     }
@@ -486,8 +471,156 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Orchestrator: patch settings.json with RTK hook
-/// Handles reading, checking, prompting, merging, backing up, and atomic writing
+/// Remove Cursor RTK: hook script, rules file, hooks.json entry (and any RTK block in other cursor config)
+fn uninstall_cursor(global: bool, verbose: u8) -> Result<()> {
+    let cursor_dir = resolve_cursor_dir(global)?;
+    let mut removed = Vec::new();
+
+    let hook_path = cursor_dir.join("hooks").join("rtk-rewrite.sh");
+    if hook_path.exists() {
+        fs::remove_file(&hook_path)
+            .with_context(|| format!("Failed to remove hook: {}", hook_path.display()))?;
+        removed.push(format!("Hook: {}", hook_path.display()));
+    }
+
+    let rules_path = cursor_dir.join("rules").join("rtk.mdc");
+    if rules_path.exists() {
+        fs::remove_file(&rules_path)
+            .with_context(|| format!("Failed to remove rules: {}", rules_path.display()))?;
+        removed.push(format!("Rules: {}", rules_path.display()));
+    }
+
+    let hooks_json_path = cursor_dir.join("hooks.json");
+    if remove_cursor_hook_from_json(&hooks_json_path, verbose)? {
+        removed.push("hooks.json: removed RTK preToolUse entry".to_string());
+    }
+
+    if removed.is_empty() {
+        println!("RTK was not installed for Cursor (nothing to remove)");
+    } else {
+        println!("RTK Cursor uninstalled:");
+        for item in &removed {
+            println!("  - {}", item);
+        }
+        println!("\nRestart Cursor to apply changes.");
+    }
+    Ok(())
+}
+
+/// Remove RTK preToolUse entry from Cursor hooks.json; backup and rewrite file. Returns true if entry was removed.
+fn remove_cursor_hook_from_json(hooks_json_path: &Path, verbose: u8) -> Result<bool> {
+    if !hooks_json_path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(hooks_json_path)
+        .with_context(|| format!("Failed to read {}", hooks_json_path.display()))?;
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut root: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", hooks_json_path.display()))?;
+    let removed = remove_cursor_hook_from_json_value(&mut root);
+    if removed {
+        let backup = hooks_json_path.with_extension("json.bak");
+        fs::copy(hooks_json_path, &backup)
+            .with_context(|| format!("Failed to backup {}", hooks_json_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup.display());
+        }
+        let out = serde_json::to_string_pretty(&root).context("Failed to serialize hooks.json")?;
+        atomic_write(hooks_json_path, &out)?;
+        if verbose > 0 {
+            eprintln!("Removed RTK hook from hooks.json");
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove RTK preToolUse entry from parsed JSON; return true if any entry was removed
+fn remove_cursor_hook_from_json_value(root: &mut serde_json::Value) -> bool {
+    let pre = match root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("preToolUse"))
+        .and_then(|p| p.as_array_mut())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+    let before = pre.len();
+    pre.retain(|entry| {
+        let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+        !(cmd.contains("rtk-rewrite.sh"))
+    });
+    before != pre.len()
+}
+
+/// Generic JSON registry patcher: read, check, prompt, merge, backup, write.
+/// Shared by Claude (settings.json) and Cursor (hooks.json); add new agents by passing their is_present/insert/on_skip.
+fn patch_json_registry<F1, F2, F3>(
+    path: &Path,
+    hook_command: &str,
+    is_present: F1,
+    insert: F2,
+    on_skip_or_decline: F3,
+    mode: PatchMode,
+    verbose: u8,
+    already_present_msg: &str,
+    success_msg: &str,
+) -> Result<PatchResult>
+where
+    F1: Fn(&serde_json::Value, &str) -> bool,
+    F2: Fn(&mut serde_json::Value, &str),
+    F3: Fn(),
+{
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if is_present(&root, hook_command) {
+        if verbose > 0 {
+            eprintln!("{}", already_present_msg);
+        }
+        return Ok(PatchResult::AlreadyPresent);
+    }
+
+    match mode {
+        PatchMode::Skip => {
+            on_skip_or_decline();
+            return Ok(PatchResult::Skipped);
+        }
+        PatchMode::Ask => {
+            if !prompt_user_consent(path)? {
+                on_skip_or_decline();
+                return Ok(PatchResult::Declined);
+            }
+        }
+        PatchMode::Auto => {}
+    }
+
+    insert(&mut root, hook_command);
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        fs::copy(path, &backup).with_context(|| format!("Failed to backup {}", path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup.display());
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&root).context("Failed to serialize JSON")?;
+    atomic_write(path, &serialized)?;
+    println!("\n  {}", success_msg);
+    Ok(PatchResult::Patched)
+}
+
+/// Patch Claude Code settings.json with RTK hook
 fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
     let claude_dir = resolve_claude_dir()?;
     let settings_path = claude_dir.join("settings.json");
@@ -495,74 +628,27 @@ fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result
         .to_str()
         .context("Hook path contains invalid UTF-8")?;
 
-    // Read or create settings.json
-    let mut root = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
-
-        if content.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+    let result = patch_json_registry(
+        &settings_path,
+        hook_command,
+        hook_already_present,
+        insert_hook_entry,
+        || print_manual_instructions(hook_path),
+        mode,
+        verbose,
+        "settings.json: hook already present",
+        "settings.json: hook added",
+    )?;
+    if result == PatchResult::Patched {
+        if settings_path.with_extension("json.bak").exists() {
+            println!(
+                "  Backup: {}",
+                settings_path.with_extension("json.bak").display()
+            );
         }
-    } else {
-        serde_json::json!({})
-    };
-
-    // Check idempotency
-    if hook_already_present(&root, &hook_command) {
-        if verbose > 0 {
-            eprintln!("settings.json: hook already present");
-        }
-        return Ok(PatchResult::AlreadyPresent);
+        println!("  Restart Claude Code. Test with: git status");
     }
-
-    // Handle mode
-    match mode {
-        PatchMode::Skip => {
-            print_manual_instructions(hook_path);
-            return Ok(PatchResult::Skipped);
-        }
-        PatchMode::Ask => {
-            if !prompt_user_consent(&settings_path)? {
-                print_manual_instructions(hook_path);
-                return Ok(PatchResult::Declined);
-            }
-        }
-        PatchMode::Auto => {
-            // Proceed without prompting
-        }
-    }
-
-    // Deep-merge hook
-    insert_hook_entry(&mut root, &hook_command);
-
-    // Backup original
-    if settings_path.exists() {
-        let backup_path = settings_path.with_extension("json.bak");
-        fs::copy(&settings_path, &backup_path)
-            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
-        if verbose > 0 {
-            eprintln!("Backup: {}", backup_path.display());
-        }
-    }
-
-    // Atomic write
-    let serialized =
-        serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
-    atomic_write(&settings_path, &serialized)?;
-
-    println!("\n  settings.json: hook added");
-    if settings_path.with_extension("json.bak").exists() {
-        println!(
-            "  Backup: {}",
-            settings_path.with_extension("json.bak").display()
-        );
-    }
-    println!("  Restart Claude Code. Test with: git status");
-
-    Ok(PatchResult::Patched)
+    Ok(result)
 }
 
 /// Clean up consecutive blank lines (collapse 3+ to 2)
@@ -680,7 +766,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
 
     // 1. Prepare hook directory and install hook
     let (_hook_dir, hook_path) = prepare_hook_paths()?;
-    ensure_hook_installed(&hook_path, verbose)?;
+    ensure_agent_hook_installed(&hook_path, verbose)?;
 
     // 2. Write RTK.md
     write_if_changed(&rtk_md_path, RTK_SLIM, "RTK.md", verbose)?;
@@ -737,7 +823,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
 
     // Prepare and install hook
     let (_hook_dir, hook_path) = prepare_hook_paths()?;
-    ensure_hook_installed(&hook_path, verbose)?;
+    ensure_agent_hook_installed(&hook_path, verbose)?;
 
     println!("\nRTK hook installed (hook-only mode).\n");
     println!("  Hook: {}", hook_path.display());
@@ -1000,8 +1086,244 @@ fn resolve_claude_dir() -> Result<PathBuf> {
         .context("Cannot determine home directory. Is $HOME set?")
 }
 
+/// Resolve Cursor config directory: ~/.cursor (global) or .cursor in current dir (project)
+fn resolve_cursor_dir(global: bool) -> Result<PathBuf> {
+    if global {
+        dirs::home_dir()
+            .map(|h| h.join(".cursor"))
+            .context("Cannot determine home directory. Is $HOME set?")
+    } else {
+        Ok(std::env::current_dir()
+            .context("Cannot determine current directory")?
+            .join(".cursor"))
+    }
+}
+
+/// Prepare Cursor hook and rules paths; create directories
+fn prepare_cursor_paths(global: bool) -> Result<(PathBuf, PathBuf)> {
+    let cursor_dir = resolve_cursor_dir(global)?;
+    let hooks_dir = cursor_dir.join("hooks");
+    let rules_dir = cursor_dir.join("rules");
+    fs::create_dir_all(&hooks_dir).with_context(|| {
+        format!(
+            "Failed to create Cursor hooks directory: {}",
+            hooks_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&rules_dir).with_context(|| {
+        format!(
+            "Failed to create Cursor rules directory: {}",
+            rules_dir.display()
+        )
+    })?;
+    Ok((hooks_dir.join("rtk-rewrite.sh"), rules_dir.join("rtk.mdc")))
+}
+
+/// Install the shared rtk-rewrite hook script at the given path. Used by Cursor and any future agent (Codex, OpenCode, etc.).
+fn ensure_agent_hook_installed(hook_path: &Path, verbose: u8) -> Result<()> {
+    write_if_changed(hook_path, REWRITE_HOOK, "hook", verbose)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+    }
+    // Store SHA-256 hash for runtime integrity verification (idempotent).
+    integrity::store_hash(hook_path)
+        .with_context(|| format!("Failed to store integrity hash for {}", hook_path.display()))?;
+    if verbose > 0 {
+        eprintln!("Hook: {}", hook_path.display());
+    }
+    Ok(())
+}
+
+/// Run init for Cursor: hook script + rules file + hooks.json
+///
+/// Hook contract (Cursor preToolUse):
+///   Input:  `{ "hook_event_name": "preToolUse", "tool_input": { "command": "..." }, ... }`
+///   Output: `{ "decision": "allow", "updated_input": { "command": "rtk ..." } }`
+/// See <https://docs.cursor.com/context/hooks> for the full specification.
+#[cfg(not(unix))]
+fn run_cursor_mode(_global: bool, _patch_mode: PatchMode, _verbose: u8) -> Result<()> {
+    anyhow::bail!(
+        "Cursor hook init requires Unix (macOS/Linux). \
+         The RTK rewrite hook is a bash script and cannot run on Windows natively. \
+         Use WSL on Windows."
+    )
+}
+
+#[cfg(unix)]
+fn run_cursor_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<()> {
+    let (hook_path, rules_path) = prepare_cursor_paths(global)?;
+
+    // 1. Install shared hook script (auto-detects Cursor vs Claude from payload)
+    ensure_agent_hook_installed(&hook_path, verbose)?;
+
+    // 2. Write rules file
+    write_if_changed(&rules_path, CURSOR_RTK_RULES, "rtk.mdc", verbose)?;
+
+    // 3. Patch hooks.json
+    let patch_result = patch_cursor_hooks_json(global, patch_mode, verbose)?;
+    match patch_result {
+        PatchResult::Patched => {}
+        PatchResult::AlreadyPresent => println!("\n  hooks.json: RTK hook already present"),
+        PatchResult::Declined | PatchResult::Skipped => {
+            // Manual instructions already printed by patch_cursor_hooks_json
+        }
+    }
+
+    let scope = if global {
+        "global (~/.cursor)"
+    } else {
+        "project (.cursor)"
+    };
+    println!("\nRTK Cursor init complete ({}).", scope);
+    println!("  Hook:   {}", hook_path.display());
+    println!("  Rules:  {}", rules_path.display());
+    println!("  Restart Cursor. Test with: git status");
+
+    Ok(())
+}
+
+/// Print manual instructions for adding RTK to Cursor hooks.json
+fn print_cursor_manual_instructions(hooks_json_path: &Path, hook_command: &str) {
+    println!("\n  MANUAL: Add to {}:", hooks_json_path.display());
+    println!("  {{ \"version\": 1, \"hooks\": {{ \"preToolUse\": [ {{ \"command\": \"{}\", \"matcher\": \"Shell\" }} ] }} }}", hook_command);
+}
+
+/// Patch Cursor hooks.json to register preToolUse (Shell) hook
+fn patch_cursor_hooks_json(global: bool, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
+    let cursor_dir = resolve_cursor_dir(global)?;
+    let hooks_json_path = cursor_dir.join("hooks.json");
+    let hook_command = if global {
+        "./hooks/rtk-rewrite.sh"
+    } else {
+        ".cursor/hooks/rtk-rewrite.sh"
+    };
+
+    patch_json_registry(
+        &hooks_json_path,
+        hook_command,
+        cursor_hook_already_present,
+        insert_cursor_hook_entry,
+        || print_cursor_manual_instructions(&hooks_json_path, hook_command),
+        mode,
+        verbose,
+        "hooks.json: RTK hook already present",
+        "hooks.json: RTK preToolUse (Shell) hook added",
+    )
+}
+
+fn insert_cursor_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
+    let root_obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            *root = serde_json::json!({});
+            root.as_object_mut()
+                .expect("Just created object, must succeed")
+        }
+    };
+
+    root_obj
+        .entry("version")
+        .or_insert_with(|| serde_json::json!(1));
+
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let hooks_obj = hooks.as_object_mut().expect("Just ensured hooks is object");
+
+    let pre_tool_use = hooks_obj
+        .entry("preToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    if !pre_tool_use.is_array() {
+        *pre_tool_use = serde_json::json!([]);
+    }
+    let arr = pre_tool_use
+        .as_array_mut()
+        .expect("Just ensured preToolUse is array");
+
+    arr.push(serde_json::json!({
+        "command": hook_command,
+        "matcher": "Shell"
+    }));
+}
+
+fn cursor_hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let arr = match root
+        .get("hooks")
+        .and_then(|h| h.get("preToolUse"))
+        .and_then(|p| p.as_array())
+    {
+        Some(a) => a,
+        None => return false,
+    };
+    for entry in arr {
+        let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+        if cmd == hook_command || cmd.contains("rtk-rewrite.sh") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Show Cursor rtk configuration (global and project)
+fn show_cursor_config() -> Result<()> {
+    println!("📋 rtk Cursor Configuration:\n");
+
+    for (label, global) in [("Global (~/.cursor)", true), ("Project (.cursor)", false)] {
+        if let Ok(cursor_dir) = resolve_cursor_dir(global) {
+            let hook_path = cursor_dir.join("hooks").join("rtk-rewrite.sh");
+            let rules_path = cursor_dir.join("rules").join("rtk.mdc");
+            let hooks_json_path = cursor_dir.join("hooks.json");
+
+            println!("  {}:", label);
+            if hook_path.exists() {
+                println!("    ✅ Hook: {}", hook_path.display());
+            } else {
+                println!("    ⚪ Hook: not found");
+            }
+            if rules_path.exists() {
+                println!("    ✅ Rules: {}", rules_path.display());
+            } else {
+                println!("    ⚪ Rules: not found");
+            }
+            if hooks_json_path.exists() {
+                let content = fs::read_to_string(&hooks_json_path)?;
+                if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let cmd = if global {
+                        "./hooks/rtk-rewrite.sh"
+                    } else {
+                        ".cursor/hooks/rtk-rewrite.sh"
+                    };
+                    if cursor_hook_already_present(&root, cmd) {
+                        println!("    ✅ hooks.json: RTK preToolUse configured");
+                    } else {
+                        println!("    ⚪ hooks.json: RTK hook not configured");
+                    }
+                } else {
+                    println!("    ⚠️  hooks.json: invalid JSON");
+                }
+            } else {
+                println!("    ⚪ hooks.json: not found");
+            }
+            println!();
+        }
+    }
+    println!("  rtk init --cursor         # Project .cursor");
+    println!("  rtk init --cursor -g       # Global ~/.cursor");
+    println!("  rtk init --cursor -g --uninstall  # Remove global Cursor RTK");
+    Ok(())
+}
+
 /// Show current rtk configuration
-pub fn show_config() -> Result<()> {
+pub fn show_config(target: InitTarget) -> Result<()> {
+    if target == InitTarget::Cursor {
+        return show_cursor_config();
+    }
     let claude_dir = resolve_claude_dir()?;
     let hook_path = claude_dir.join("hooks").join("rtk-rewrite.sh");
     let rtk_md_path = claude_dir.join("RTK.md");
@@ -1061,7 +1383,8 @@ pub fn show_config() -> Result<()> {
         Ok(integrity::IntegrityStatus::NoBaseline) => {
             println!("⚠️  Integrity: no baseline hash (run: rtk init -g to establish)");
         }
-        Ok(integrity::IntegrityStatus::NotInstalled) | Ok(integrity::IntegrityStatus::OrphanedHash) => {
+        Ok(integrity::IntegrityStatus::NotInstalled)
+        | Ok(integrity::IntegrityStatus::OrphanedHash) => {
             // Don't show integrity line if hook isn't installed
         }
         Err(_) => {
@@ -1372,6 +1695,56 @@ More notes
 
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
         assert!(!hook_already_present(&json_content, hook_command));
+    }
+
+    // Tests for cursor_hook_already_present()
+    #[test]
+    fn test_cursor_hook_already_present_exact_match() {
+        let json_content = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [{ "command": ".cursor/hooks/rtk-rewrite.sh", "matcher": "Shell" }]
+            }
+        });
+        assert!(cursor_hook_already_present(
+            &json_content,
+            ".cursor/hooks/rtk-rewrite.sh"
+        ));
+    }
+
+    #[test]
+    fn test_cursor_hook_already_present_rtk_substring() {
+        let json_content = serde_json::json!({
+            "hooks": { "preToolUse": [{ "command": "./hooks/rtk-rewrite.sh", "matcher": "Shell" }] }
+        });
+        assert!(cursor_hook_already_present(
+            &json_content,
+            "./hooks/rtk-rewrite.sh"
+        ));
+    }
+
+    #[test]
+    fn test_cursor_hook_not_present() {
+        let json_content = serde_json::json!({ "version": 1, "hooks": { "preToolUse": [] } });
+        assert!(!cursor_hook_already_present(
+            &json_content,
+            ".cursor/hooks/rtk-rewrite.sh"
+        ));
+    }
+
+    #[test]
+    fn test_remove_cursor_hook_from_json() {
+        let temp = TempDir::new().unwrap();
+        let hooks_json = temp.path().join("hooks.json");
+        let content = r#"{"version":1,"hooks":{"preToolUse":[{"command":".cursor/hooks/rtk-rewrite.sh","matcher":"Shell"},{"command":"./other.sh","matcher":"Shell"}]}}"#;
+        fs::write(&hooks_json, content).unwrap();
+        let removed = remove_cursor_hook_from_json(&hooks_json, 0).unwrap();
+        assert!(removed);
+        let out = fs::read_to_string(&hooks_json).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let pre = root["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["command"], "./other.sh");
     }
 
     // Tests for insert_hook_entry()

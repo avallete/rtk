@@ -5,6 +5,16 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Features
+
+* **init:** add Cursor support (`rtk init --cursor`) ([#213](https://github.com/rtk-ai/rtk/issues/213))
+  * Hook script supports both Claude Code and Cursor preToolUse (auto-detect payload)
+  * Installs hook + rules (rtk.mdc) + hooks.json for global (~/.cursor) or project (.cursor)
+  * `rtk init --cursor --show` and `rtk init --cursor -g --uninstall`
+* **init:** refactor for multi-agent: `InitTarget` enum, shared `patch_json_registry`, `ensure_agent_hook_installed` (enables adding Codex, OpenCode, etc.)
+
 ## [0.23.0](https://github.com/rtk-ai/rtk/compare/v0.22.2...v0.23.0) (2026-02-28)
 
 

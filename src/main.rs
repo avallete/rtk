@@ -319,6 +319,10 @@ enum Commands {
         #[arg(long)]
         show: bool,
 
+        /// Initialize for Cursor (hooks + rules in ~/.cursor or .cursor)
+        #[arg(long, conflicts_with_all = ["claude_md", "hook_only"])]
+        cursor: bool,
+
         /// Inject full instructions into CLAUDE.md (legacy mode)
         #[arg(long = "claude-md", group = "mode")]
         claude_md: bool,
@@ -1358,16 +1362,18 @@ fn main() -> Result<()> {
         Commands::Init {
             global,
             show,
+            cursor,
             claude_md,
             hook_only,
             auto_patch,
             no_patch,
             uninstall,
         } => {
+            let target = init::InitTarget::from_cursor_flag(cursor);
             if show {
-                init::show_config()?;
+                init::show_config(target)?;
             } else if uninstall {
-                init::uninstall(global, cli.verbose)?;
+                init::uninstall(global, cli.verbose, target)?;
             } else {
                 let patch_mode = if auto_patch {
                     init::PatchMode::Auto
@@ -1376,7 +1382,14 @@ fn main() -> Result<()> {
                 } else {
                     init::PatchMode::Ask
                 };
-                init::run(global, claude_md, hook_only, patch_mode, cli.verbose)?;
+                init::run(
+                    global,
+                    claude_md,
+                    hook_only,
+                    patch_mode,
+                    cli.verbose,
+                    target,
+                )?;
             }
         }
 
